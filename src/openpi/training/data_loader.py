@@ -131,15 +131,17 @@ def create_torch_dataset(
     data_config: _config.DataConfig, action_horizon: int, model_config: _model.BaseModelConfig
 ) -> Dataset:
     """Create a dataset for training."""
-    repo_id = data_config.repo_id
-    if repo_id is None:
-        raise ValueError("Repo ID is not set. Cannot create dataset.")
-    if repo_id == "fake":
+    repo_ids = data_config.repo_ids
+    if repo_ids is None:
+        raise ValueError("No repo_ids set. Cannot create dataset.")
+    if repo_ids[0] == "fake":
         return FakeDataset(model_config, num_samples=1024)
 
-    dataset_meta = lerobot_dataset.LeRobotDatasetMetadata(repo_id)
-    dataset = lerobot_dataset.LeRobotDataset(
-        data_config.repo_id,
+    dataset_meta = lerobot_dataset.LeRobotDatasetMetadata(root=data_config.root + "/" + repo_ids[0], repo_id=repo_ids[0])
+
+    dataset = lerobot_dataset.MultiLeRobotDataset(
+        root=data_config.root,
+        repo_ids=repo_ids,
         delta_timestamps={
             key: [t / dataset_meta.fps for t in range(action_horizon)] for key in data_config.action_sequence_keys
         },
@@ -172,7 +174,7 @@ def create_rlds_dataset(
 def transform_dataset(dataset: Dataset, data_config: _config.DataConfig, *, skip_norm_stats: bool = False) -> Dataset:
     """Transform the dataset by applying the data transforms."""
     norm_stats = {}
-    if data_config.repo_id != "fake" and not skip_norm_stats:
+    if data_config.repo_ids[0] != "fake" and not skip_norm_stats:
         if data_config.norm_stats is None:
             raise ValueError(
                 "Normalization stats not found. "
@@ -200,7 +202,7 @@ def transform_iterable_dataset(
 ) -> IterableDataset:
     """Transform the dataset by applying the data transforms."""
     norm_stats = {}
-    if data_config.repo_id != "fake" and not skip_norm_stats:
+    if data_config.repo_ids[0] != "fake" and not skip_norm_stats:
         if data_config.norm_stats is None:
             raise ValueError(
                 "Normalization stats not found. "

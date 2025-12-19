@@ -16,10 +16,10 @@ import optax
 import tqdm_loggable.auto as tqdm
 import wandb
 
+import openpi.training.checkpoints as _checkpoints
 import openpi.models.model as _model
 import openpi.shared.array_typing as at
 import openpi.shared.nnx_utils as nnx_utils
-import openpi.training.checkpoints as _checkpoints
 import openpi.training.config as _config
 import openpi.training.data_loader as _data_loader
 import openpi.training.optimizer as _optimizer

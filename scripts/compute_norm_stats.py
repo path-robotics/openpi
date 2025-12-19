@@ -3,6 +3,10 @@
 This script is used to compute the normalization statistics for a given config. It
 will compute the mean and standard deviation of the data in the dataset and save it
 to the config assets directory.
+
+A change has been made to support multiple repo_ids in the data config. The output
+normalization statistics will be saved in a folder named after the common prefix of
+the repo_ids. This is a path robotics-specific change.
 """
 
 import numpy as np
@@ -29,7 +33,7 @@ def create_torch_dataloader(
     num_workers: int,
     max_frames: int | None = None,
 ) -> tuple[_data_loader.Dataset, int]:
-    if data_config.repo_id is None:
+    if data_config.repo_ids is None:
         raise ValueError("Data config must have a repo_id")
     dataset = _data_loader.create_torch_dataset(data_config, action_horizon, model_config)
     dataset = _data_loader.TransformedDataset(
@@ -108,7 +112,11 @@ def main(config_name: str, max_frames: int | None = None):
 
     norm_stats = {key: stats.get_statistics() for key, stats in stats.items()}
 
-    output_path = config.assets_dirs / data_config.repo_id
+    folder_name = ""
+    for x in data_config.repo_ids[0].split("_")[:-1]:
+        folder_name += x + "_"
+    folder_name = folder_name[:-1]
+    output_path = config.assets_dirs / folder_name
     print(f"Writing stats to: {output_path}")
     normalize.save(output_path, norm_stats)
 
