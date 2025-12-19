@@ -66,10 +66,21 @@ def posemb_sincos(
 class Pi0(_model.BaseModel):
     def __init__(self, config: pi0_config.Pi0Config, rngs: nnx.Rngs):
         super().__init__(config.action_dim, config.action_horizon, config.max_token_len)
+        '''
+        Initializes a Pi0 model based on the PaliGemma architecture.
+        '''
+        
+        # Flag for pi0.5 vs pi0 models.
         self.pi05 = config.pi05
+
+        # Load the PaliGemma VLM configuration 
         paligemma_config = _gemma.get_config(config.paligemma_variant)
+
+        # Load the action expert configuration (Also, a transformer model)
         action_expert_config = _gemma.get_config(config.action_expert_variant)
+
         # TODO: rewrite gemma in NNX. For now, use bridge.
+        # Creates and wraps old Gemma model to NNX to behave like an NNX Module.
         llm = nnx_bridge.ToNNX(
             _gemma.Module(
                 configs=[paligemma_config, action_expert_config],
@@ -77,7 +88,10 @@ class Pi0(_model.BaseModel):
                 adarms=config.pi05,
             )
         )
+        # Lazy init the LLM to avoid allocating parameters immediately when you construct the wrapper.
         llm.lazy_init(rngs=rngs, method="init", use_adarms=[False, True] if config.pi05 else [False, False])
+        
+        # Creates and wraps the PaliGemma image encoder to NNX to behave like an NNX Module. (A Transformer)        
         img = nnx_bridge.ToNNX(
             _siglip.Module(
                 num_classes=paligemma_config.width,
@@ -87,8 +101,13 @@ class Pi0(_model.BaseModel):
                 dtype_mm=config.dtype,
             )
         )
+        # Lazy init the image encoder to avoid allocating parameters immediately when you construct the wrapper.
         img.lazy_init(next(iter(config.fake_obs().images.values())), train=False, rngs=rngs)
+
+        # Combine LLM and image encoder into a PaliGemma model.
         self.PaliGemma = nnx.Dict(llm=llm, img=img)
+
+        # Action expert input/output projections and MLPs.
         self.action_in_proj = nnx.Linear(config.action_dim, action_expert_config.width, rngs=rngs)
         if config.pi05:
             self.time_mlp_in = nnx.Linear(action_expert_config.width, action_expert_config.width, rngs=rngs)
@@ -106,14 +125,22 @@ class Pi0(_model.BaseModel):
     def embed_prefix(
         self, obs: _model.Observation
     ) -> tuple[at.Float[at.Array, "b s emb"], at.Bool[at.Array, "b s"], at.Bool[at.Array, " s"]]:
+        ''' 
+        Function for embedding images and text prompt into tokens as input to PaliGemma LLM part.
+        All image and text tokens are attending to each other (non-causal).
+        '''
+        # Lists for masks and tokens.
         input_mask = []
         ar_mask = []
         tokens = []
-        # embed images
-        for name in obs.images:
-            image_tokens, _ = self.PaliGemma.img(obs.images[name], train=False)
 
+        # Embed images into tokens
+        for name in obs.images:
+            # Get Image tokens from PaliGemma image encoder
+            image_tokens, _ = self.PaliGemma.img(obs.images[name], train=False)
             tokens.append(image_tokens)
+
+            # Build Masks for the image tokens
             input_mask.append(
                 einops.repeat(
                     obs.image_masks[name],
@@ -124,7 +151,7 @@ class Pi0(_model.BaseModel):
             # image tokens attend to each other
             ar_mask += [False] * image_tokens.shape[1]
 
-        # add language (aka tokenized inputs)
+        # Add language tokens (Task Prompt) (aka tokenized inputs)
         if obs.tokenized_prompt is not None:
             tokenized_inputs = self.PaliGemma.llm(obs.tokenized_prompt, method="embed")
             tokens.append(tokenized_inputs)
@@ -145,20 +172,29 @@ class Pi0(_model.BaseModel):
         at.Bool[at.Array, " s"],
         at.Float[at.Array, "b emb"] | None,
     ]:
+        '''
+        Function for embedding noisy actions and timestep into tokens as input to Action Expert Transformer.
+        '''
+        # Lists for masks and tokens.
         input_mask = []
         ar_mask = []
         tokens = []
+
+        # Add a single state token if not using pi05
         if not self.pi05:
             # add a single state token
             state_token = self.state_proj(obs.state)[:, None, :]
             tokens.append(state_token)
             input_mask.append(jnp.ones((obs.state.shape[0], 1), dtype=jnp.bool_))
+            
             # image/language inputs do not attend to state or actions
             ar_mask += [True]
 
+        # Embed noisy actions into tokens
         action_tokens = self.action_in_proj(noisy_actions)
         # embed timestep using sine-cosine positional encoding with sensitivity in the range [0, 1]
         time_emb = posemb_sincos(timestep, self.action_in_proj.out_features, min_period=4e-3, max_period=4.0)
+        
         if self.pi05:
             # time MLP (for adaRMS)
             time_emb = self.time_mlp_in(time_emb)
@@ -178,6 +214,7 @@ class Pi0(_model.BaseModel):
             adarms_cond = None
         tokens.append(action_expert_tokens)
         input_mask.append(jnp.ones(action_expert_tokens.shape[:2], dtype=jnp.bool_))
+
         # image/language/state inputs do not attend to action tokens
         ar_mask += [True] + ([False] * (self.action_horizon - 1))
         tokens = jnp.concatenate(tokens, axis=1)
@@ -189,9 +226,16 @@ class Pi0(_model.BaseModel):
     def compute_loss(
         self, rng: at.KeyArrayLike, observation: _model.Observation, actions: _model.Actions, *, train: bool = False
     ) -> at.Float[at.Array, "*b ah"]:
+        '''
+        Computes the Flow-Matching loss for the Pi0 model.
+        '''
+
+        # Split RNGs for preprocessing, noise sampling, and timestep sampling.
         preprocess_rng, noise_rng, time_rng = jax.random.split(rng, 3)
+        # Preprocess observation (images, state, prompt).
         observation = _model.preprocess_observation(preprocess_rng, observation, train=train)
 
+        # Sample noise and timesteps.
         batch_shape = actions.shape[:-2]
         noise = jax.random.normal(noise_rng, actions.shape)
         time = jax.random.beta(time_rng, 1.5, 1, batch_shape) * 0.999 + 0.001
@@ -200,12 +244,23 @@ class Pi0(_model.BaseModel):
         u_t = noise - actions
 
         # one big forward pass of prefix + suffix at once
+
+        # Embed prefix (images + prompt)
         prefix_tokens, prefix_mask, prefix_ar_mask = self.embed_prefix(observation)
+        # Embed suffix (noisy actions + timestep)
         suffix_tokens, suffix_mask, suffix_ar_mask, adarms_cond = self.embed_suffix(observation, x_t, time)
+
+        # Combine masks. input_mask indicates existence of a particular token. False for missing tokens. 
         input_mask = jnp.concatenate([prefix_mask, suffix_mask], axis=1)
+
+        # ar_mask indicates which tokens cannot be attended to by subsequent tokens. Causal Block definition.
         ar_mask = jnp.concatenate([prefix_ar_mask, suffix_ar_mask], axis=0)
+
+        # Create attention mask combining input existence and autoregressive constraints
         attn_mask = make_attn_mask(input_mask, ar_mask)
         positions = jnp.cumsum(input_mask, axis=1) - 1
+
+        # Forward pass through PaliGemma (Both VLM and Action Expert)
         (prefix_out, suffix_out), _ = self.PaliGemma.llm(
             [prefix_tokens, suffix_tokens], mask=attn_mask, positions=positions, adarms_cond=[None, adarms_cond]
         )
