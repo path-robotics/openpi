@@ -184,7 +184,13 @@ class DataConfigFactory(abc.ABC):
     def create_base_config(self, assets_dirs: pathlib.Path, model_config: _model.BaseModelConfig) -> DataConfig:
         root = self.root if self.root is not None else None
         repo_ids = self.repo_ids if self.repo_ids is not tyro.MISSING else None
-        asset_id = self.assets.asset_id or repo_ids[0] if repo_ids is not None else None
+
+        folder_name = ""
+        for x in repo_ids[0].split("_")[:-1]:
+            folder_name += x + "_"
+        folder_name = folder_name[:-1]
+        asset_id = self.assets.asset_id or folder_name if repo_ids is not None else None
+        
         return dataclasses.replace(
             self.base_config or DataConfig(),
             root=root,
@@ -1014,7 +1020,7 @@ _CONFIGS = [
         action_expert_variant="gemma_300m_lora",
     ),
     data=LeRobotLadderClipDataConfig(
-        root="/home/path/Desktop/robot-learning/data",
+        root="/home/ubuntu/datasets",
         repo_ids=["ladder_clip_15","ladder_clip_16"],
 
         base_config=DataConfig(prompt_from_task=False),  # your LadderClipInputs sets prompt internally
@@ -1031,7 +1037,28 @@ _CONFIGS = [
         # must match the model config above if you set action_dim/horizon there too
     ).get_freeze_filter(),
     ema_decay=None,
+    wandb_enabled=False,
     ),  
+    TrainConfig(
+        # Change the name to reflect your model and dataset.
+        name="pi0_ladderclip_finetune",
+        model=pi0_config.Pi0Config(),
+        data=LeRobotLadderClipDataConfig(
+        root="/home/ubuntu/datasets",
+        repo_ids=["ladder_clip_14","ladder_clip_15",
+                    "ladder_clip_16","ladder_clip_17", 
+                    "ladder_clip_18", "ladder_clip_19", 
+                    "ladder_clip_20","ladder_clip_21", 
+                    "ladder_clip_22", "ladder_clip_23"],
+
+        base_config=DataConfig(prompt_from_task=False),  # your LadderClipInputs sets prompt internally
+        extra_delta_transform=True,  # because your actions are absolute
+        action_dim=16,
+        ),
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi0_base/params"),
+        num_train_steps=30_000,
+        save_interval=5_000
+    ),
     # RoboArena & PolaRiS configs.
     *roboarena_config.get_roboarena_configs(),
     *polaris_config.get_polaris_configs(),
