@@ -170,3 +170,6 @@ cython_debug/
 
 # copilot-instructions
 .github/copilot-instructions.md
+
+# EC2 Instance Key
+*.pem
