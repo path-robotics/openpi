@@ -1,13 +1,13 @@
+import time
 from openpi.training import config as _config
 from openpi.policies import policy_config
-import openpi.training.data_loader as _data_loader
 
 from lerobot.common.datasets.lerobot_dataset import (
     LeRobotDataset,
     LeRobotDatasetMetadata)
 
 config = _config.get_config("pi0_ladderclip_finetune")
-checkpoint_dir = "/home/path/Desktop/openpi/checkpoints/pi0_ladderclip_finetune/10000"
+checkpoint_dir = "/home/path/Desktop/openpi/checkpoints/pi0_ladderclip_finetune/20000"
 print("Checkpoint dir:", checkpoint_dir)
 
 
@@ -30,5 +30,12 @@ sample['observation.images.wrist_1_rgb'] = sample['observation.images.wrist_1_rg
 sample['observation.images.wrist_2_rgb'] = sample['observation.images.wrist_2_rgb'][None, ...]  # Add batch dimension
 
 # Run the policy on a sample.
-action = policy.infer(sample)
-print("Inferred action Shape:", action['actions'].shape)
+# Warmup (compilation)
+_ = policy.infer(sample)
+
+# Timed run
+start = time.time()
+op = policy.infer(sample)
+end = time.time()
+print("Inferred action Shape:", op['actions'].shape)
+print("Inference time (s):", end - start)

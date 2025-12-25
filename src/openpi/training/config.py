@@ -1044,7 +1044,7 @@ _CONFIGS = [
         name="pi0_ladderclip_finetune",
         model=pi0_config.Pi0Config(),
         data=LeRobotLadderClipDataConfig(
-        root="/home/ubuntu/datasets",
+        root="/home/path/Desktop/robot-learning/data",
         repo_ids=["ladder_clip_14","ladder_clip_15",
                     "ladder_clip_16","ladder_clip_17", 
                     "ladder_clip_18", "ladder_clip_19", 
