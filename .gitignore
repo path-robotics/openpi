@@ -173,3 +173,6 @@ cython_debug/
 
 # EC2 Instance Key
 *.pem
+
+# Plots Folder
+plots/
