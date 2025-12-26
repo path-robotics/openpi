@@ -19,7 +19,8 @@ import jax.numpy as jnp
 from huggingface_hub import snapshot_download
 from omegaconf import OmegaConf
 
-import openpi.path_robotics_dataset as path_robotics_dataset
+import openpi.path_robotics_robot_learning.path_robotics_dataset as path_robotics_dataset
+from openpi.path_robotics_robot_learning.path_robotics_utils import ActionQueue
 from openpi.training import config as _config
 from openpi.policies import policy_config
 
@@ -33,6 +34,8 @@ warnings.filterwarnings(
 )
 
 
+os.environ["HF_DATASETS_CACHE"] = os.path.expanduser("~/hf_datasets_cache")
+print(os.getenv("HF_DATASETS_CACHE"))
 
 # ---------- Plotting Code --------------
 def plot_2x8_dims(preds, gts, out_path="plots/ep_2x8.png", dims=None, title="", sharey=False):
@@ -95,6 +98,7 @@ def offline_rollout(
     save_preds: str | None,
     instruction: str | None,
     override_fps: int | None,
+    n_step_actions: int,
 ):
     """
     Main function for Offline rollout on a LeRobot dataset episode from the training/validation set.
@@ -133,10 +137,15 @@ def offline_rollout(
     factor = ds.meta.fps / override_fps if override_fps is not None else 1.0
     print("FPS factor:", factor)
 
+    # Initialize ActionQueue to allow for open-loop chunk-execution (not strictly necessary here)
+    rtc_enabled = True  # Set to True to simulate RTC behavior
+    action_queue = ActionQueue(rtc_enabled=rtc_enabled)
 
     for step, i in enumerate(frame_ids):
         if (step + 1) % 20 == 0:
             print(f"  Step {step+1})")
+        
+        start_time = time.time()
 
         if factor != 1.0 and step % int(factor) != 0:
             continue
@@ -155,18 +164,35 @@ def offline_rollout(
             # Warmup (compilation)
             _ = policy.infer(sample)
 
-        # query model every timestep
-        start_time = time.time()
-        op = policy.infer(sample)
-        pred = op["actions"]  # [1, n_step, A]
-        pred = pred[0, :]  # take first step only: [1, A]
-        end_time = time.time()
+        if step == 0:
+            op = policy.infer(sample)
+            pred = op["actions"]  # [1, n_step, A]
+            
+            action_queue.merge(
+                original_actions=pred,
+                processed_actions=pred,    
+                real_delay=0,
+                action_index_before_inference=0,
+            )
+        elif action_queue.qsize() == (config.model.action_horizon - n_step_actions):
+            op = policy.infer(sample)
+            pred = op["actions"]  # [1, n_step, A]
 
+            action_queue.merge(
+                original_actions=pred,
+                processed_actions=pred,    
+                real_delay=0,
+                action_index_before_inference=n_step_actions,
+            )
+        
+        predicted_action = action_queue.get()
+    
+        end_time = time.time()
         inference_time = end_time - start_time
         inference_times.append(inference_time)
 
         gt = sample_gt["actions"].numpy()
-        preds.append(pred.copy())
+        preds.append(predicted_action.copy())
         gts.append(gt.copy())
     
     
@@ -203,7 +229,7 @@ def main():
     p.add_argument("--root", required=True, help="Dataset root (folder containing data/, videos/, meta/)")
     p.add_argument("--episode", type=int, required=True, help="Episode index to evaluate")
     p.add_argument(
-        "--n_step_actions",
+        "--n-step-actions",
         type=int,
         default=None,
         help="Number of action steps to predict at each model call",
@@ -226,6 +252,7 @@ def main():
         episode_index=args.episode,
         save_preds=(args.save_preds or None),
         instruction=args.instruction,
+        n_step_actions=args.n_step_actions,
         override_fps=args.override_fps,
     )
 
