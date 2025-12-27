@@ -141,9 +141,12 @@ def offline_rollout(
     rtc_enabled = True  # Set to True to simulate RTC behavior
     action_queue = ActionQueue(rtc_enabled=rtc_enabled)
 
+    control_step = 0
+    returned = False
+    inference_delay = 5
     for step, i in enumerate(frame_ids):
         if (step + 1) % 20 == 0:
-            print(f"  Step {step+1})")
+            print(f"Step {step+1})")
         
         start_time = time.time()
 
@@ -163,29 +166,56 @@ def offline_rollout(
         if step == 0:
             # Warmup (compilation)
             _ = policy.infer(sample)
-
-        if step == 0:
-            op = policy.infer(sample)
-            pred = op["actions"]  # [1, n_step, A]
-            
-            action_queue.merge(
-                original_actions=pred,
-                processed_actions=pred,    
-                real_delay=0,
-                action_index_before_inference=0,
-            )
-        elif action_queue.qsize() == (config.model.action_horizon - n_step_actions):
-            op = policy.infer(sample)
-            pred = op["actions"]  # [1, n_step, A]
-
-            action_queue.merge(
-                original_actions=pred,
-                processed_actions=pred,    
-                real_delay=0,
-                action_index_before_inference=n_step_actions,
-            )
         
-        predicted_action = action_queue.get()
+        if not rtc_enabled:
+            op = policy.infer(sample)
+            predicted_action = op["actions"][0]
+
+        else:
+            if control_step == 0:
+                prev_actions = None
+                op = policy.infer(sample)
+                pred = op["actions"]  # [1, n_step, A]
+                raw_pred = op["actions_raw"]  # [1, n_step, A]
+
+                action_queue.merge(
+                    original_actions=pred,
+                    processed_actions=pred,    
+                    real_delay=0,
+                    action_index_before_inference=0,
+                )
+            elif control_step % (n_step_actions - inference_delay) == 0 and returned == False:
+                print(f"Control Step: {control_step}, Action Queue Size Low:{action_queue.qsize()}")
+                action_index_before = action_queue.get_action_index()
+                curr_control_step = control_step 
+                prev_actions = action_queue.get_left_over()
+                
+                op = policy.infer(
+                    sample,
+                    rtc_enabled=True,
+                    prev_action_chunk=prev_actions,   # or rename the variable too
+                    prefix_attention_horizon=config.model.action_horizon - n_step_actions + inference_delay,
+                    inference_delay=inference_delay,
+                    )
+                
+                pred = op["actions"]  # [1, n_step, A]
+                raw_pred = op["actions_raw"]  # [1, n_step, A]
+                returned = True
+            
+            predicted_action = action_queue.get()
+            control_step += 1
+
+            if returned and control_step - curr_control_step == inference_delay:
+                returned = False
+                original_actions = pred
+                postprocessed_actions = pred
+
+                action_queue.merge(
+                    original_actions=original_actions,
+                    processed_actions=postprocessed_actions,
+                    real_delay=inference_delay,
+                    action_index_before_inference=action_index_before,
+                )
     
         end_time = time.time()
         inference_time = end_time - start_time

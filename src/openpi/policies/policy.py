@@ -62,12 +62,18 @@ class Policy(BasePolicy):
         else:
             # JAX model setup
             self._sample_actions = nnx_utils.module_jit(model.sample_actions)
+            self._sample_actions_with_rtc = nnx_utils.module_jit(model.sample_actions_with_RTC)
             self._rng = rng or jax.random.key(0)
 
     @override
-    def infer(self, obs: dict, *, noise: np.ndarray | None = None) -> dict:  # type: ignore[misc]
+    def infer(self, obs: dict, *, noise: np.ndarray | None = None,
+              rtc_enabled: bool = False, prev_action_chunk: np.ndarray | None = None,
+              prefix_attention_horizon: int | None = None, inference_delay: int | None = None,
+              max_guidance_weight: float = 10.0) -> dict:  # type: ignore[misc]
         # Make a copy since transformations may modify the inputs in place.
         inputs = jax.tree.map(lambda x: x, obs)
+        if prev_action_chunk is not None: # For RTC
+            inputs['actions'] = prev_action_chunk.copy()
         inputs = self._input_transform(inputs)
         if not self._is_pytorch_model:
             # Make a batch and convert to jax.Array.
@@ -89,20 +95,38 @@ class Policy(BasePolicy):
 
         observation = _model.Observation.from_dict(inputs)
         start_time = time.monotonic()
-        outputs = {
-            "state": inputs["state"],
-            "actions": self._sample_actions(sample_rng_or_pytorch_device, observation, **sample_kwargs),
-        }
+
+        if not rtc_enabled:
+            outputs = {
+                "state": inputs["state"],
+                "actions": self._sample_actions(sample_rng_or_pytorch_device, observation, **sample_kwargs),
+            }
+        else:
+            if prev_action_chunk is None:
+                raise ValueError("rtc_enabled=True but prev_action_chunk is None")
+            if inference_delay is None:
+                raise ValueError("rtc_enabled=True but inference_delay is None")
+            # prefix_attention_horizon can default safely
+            if prefix_attention_horizon is None:
+                prefix_attention_horizon = self.action_horizon
+            outputs = {
+                "state": inputs["state"],
+                "actions": self._sample_actions_with_rtc(sample_rng_or_pytorch_device, observation, **sample_kwargs,
+                                                        prev_action_chunk=inputs['actions'], max_guidance_weight=max_guidance_weight,
+                                                        prefix_attention_horizon=prefix_attention_horizon, inference_delay=inference_delay),
+            }
         model_time = time.monotonic() - start_time
         if self._is_pytorch_model:
             outputs = jax.tree.map(lambda x: np.asarray(x[0, ...].detach().cpu()), outputs)
         else:
             outputs = jax.tree.map(lambda x: np.asarray(x[0, ...]), outputs)
+        raw_actions = outputs["actions"].copy()
 
         outputs = self._output_transform(outputs)
         outputs["policy_timing"] = {
             "infer_ms": model_time * 1000,
         }
+        outputs["actions_raw"] = raw_actions
         return outputs
 
     @property

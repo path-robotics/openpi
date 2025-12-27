@@ -62,6 +62,30 @@ def posemb_sincos(
     )
     return jnp.concatenate([jnp.sin(sinusoid_input), jnp.cos(sinusoid_input)], axis=-1)
 
+def get_prefix_weights(start: int, end: int, total: int, schedule: str) -> jax.Array:
+    """With start=2, end=6, total=10, the output will be:
+    1  1  4/5 3/5 2/5 1/5 0  0  0  0
+           ^              ^
+         start           end
+    `start` (inclusive) is where the chunk starts being allowed to change. `end` (exclusive) is where the chunk stops
+    paying attention to the prefix. if start == 0, then the entire chunk is allowed to change. if end == total, then the
+    entire prefix is attended to.
+
+    `end` takes precedence over `start` in the sense that, if `end < start`, then `start` is pushed down to `end`. Thus,
+    if `end` is 0, then the entire prefix will always be ignored.
+    """
+    start = jnp.minimum(start, end)
+    if schedule == "ones":
+        w = jnp.ones(total)
+    elif schedule == "zeros":
+        w = (jnp.arange(total) < start).astype(jnp.float32)
+    elif schedule == "linear" or schedule == "exp":
+        w = jnp.clip((start - 1 - jnp.arange(total)) / (end - start + 1) + 1, 0, 1)
+        if schedule == "exp":
+            w = w * jnp.expm1(w) / (jnp.e - 1)
+    else:
+        raise ValueError(f"Invalid schedule: {schedule}")
+    return jnp.where(jnp.arange(total) >= end, 0, w)
 
 class Pi0(_model.BaseModel):
     def __init__(self, config: pi0_config.Pi0Config, rngs: nnx.Rngs):
@@ -324,6 +348,110 @@ class Pi0(_model.BaseModel):
             v_t = self.action_out_proj(suffix_out[:, -self.action_horizon :])
 
             return x_t + dt * v_t, time + dt
+
+        def cond(carry):
+            x_t, time = carry
+            # robust to floating-point error
+            return time >= -dt / 2
+
+        x_0, _ = jax.lax.while_loop(cond, step, (noise, 1.0))
+        return x_0
+    
+
+    @override
+    def sample_actions_with_RTC(
+        self,
+        rng: at.KeyArrayLike,
+        observation: _model.Observation,
+        prev_action_chunk,  # [b, ah, ad]
+        *,
+        inference_delay: int,
+        prefix_attention_horizon: int,
+        num_steps: int | at.Int[at.Array, ""] = 10,
+        noise: at.Float[at.Array, "b ah ad"] | None = None,
+        max_guidance_weight: float = 10.0,
+    ) -> _model.Actions:
+        observation = _model.preprocess_observation(None, observation, train=False)
+        dt = -1.0 / num_steps
+        batch_size = observation.state.shape[0]
+        schedule: str = "exp"
+
+        prev_action_chunk = jnp.asarray(prev_action_chunk)
+        if len(prev_action_chunk.shape) < 3:
+            prev_action_chunk = prev_action_chunk[None, :, :]
+
+        if prev_action_chunk.shape[1] < self.action_horizon or prev_action_chunk.shape[2] < self.action_dim:
+            padded = jnp.zeros((batch_size, self.action_horizon, self.action_dim))
+            padded = padded.at[:, : prev_action_chunk.shape[1], : prev_action_chunk.shape[2]].set(prev_action_chunk)
+            prev_action_chunk = padded
+
+        if noise is None:
+            noise = jax.random.normal(rng, (batch_size, self.action_horizon, self.action_dim))
+
+        # first fill KV cache with a forward pass of the prefix
+        prefix_tokens, prefix_mask, prefix_ar_mask = self.embed_prefix(observation)
+        prefix_attn_mask = make_attn_mask(prefix_mask, prefix_ar_mask)
+        positions = jnp.cumsum(prefix_mask, axis=1) - 1
+        _, kv_cache = self.PaliGemma.llm([prefix_tokens, None], mask=prefix_attn_mask, positions=positions)
+
+        # compute guidance
+        weights = get_prefix_weights(
+                inference_delay, prefix_attention_horizon, self.action_horizon, schedule
+            )
+
+        def get_v_t_from_action_expert(x_t, time):
+            suffix_tokens, suffix_mask, suffix_ar_mask, adarms_cond = self.embed_suffix(
+                observation, x_t, jnp.broadcast_to(time, batch_size)
+            )
+
+            suffix_attn_mask = make_attn_mask(suffix_mask, suffix_ar_mask)
+
+            prefix_attn_mask = einops.repeat(prefix_mask, "b p -> b s p", s=suffix_tokens.shape[1])
+
+            full_attn_mask = jnp.concatenate([prefix_attn_mask, suffix_attn_mask], axis=-1)
+            assert full_attn_mask.shape == (
+                batch_size,
+                suffix_tokens.shape[1],
+                prefix_tokens.shape[1] + suffix_tokens.shape[1],
+            )
+
+            positions = jnp.sum(prefix_mask, axis=-1)[:, None] + jnp.cumsum(suffix_mask, axis=-1) - 1
+
+            (prefix_out, suffix_out), _ = self.PaliGemma.llm(
+                [None, suffix_tokens],
+                mask=full_attn_mask,
+                positions=positions,
+                kv_cache=kv_cache,
+                adarms_cond=[None, adarms_cond],
+            )
+
+            v_t = self.action_out_proj(suffix_out[:, -self.action_horizon :])
+            return v_t
+
+        def step(carry):
+            x_t, time = carry
+             
+            def denoiser(x_t_in):
+                v_t = get_v_t_from_action_expert(x_t_in, time)  # [b, ah, ad]
+                x0_hat = x_t_in - time * v_t             # [b, ah, ad]
+                return x0_hat, v_t  
+            
+            x0_hat, vjp_fun, v_t = jax.vjp(denoiser, x_t, has_aux=True)
+
+            error = (prev_action_chunk - x0_hat) * weights[None, :, None] 
+            correction = vjp_fun(error)[0] 
+            
+            # constants from paper
+            t_rtc = 1.0 - time
+            eps = 1e-6
+            inv_r2 = (t_rtc**2 + (1.0 - t_rtc)**2) / ((1.0 - t_rtc)**2 + eps)
+            c = jnp.nan_to_num((1.0 - t_rtc) / (t_rtc + eps), posinf=max_guidance_weight)
+            guidance_weight = jnp.minimum(c * inv_r2, max_guidance_weight)
+            
+            
+            v_t = v_t - guidance_weight * correction
+
+            return x_t + dt * v_t, time + dt   
 
         def cond(carry):
             x_t, time = carry
